@@ -10,7 +10,7 @@ import path from "node:path";
 import { config } from "./config.js";
 import { db, now, uid } from "./db/index.js";
 import { hashPassword, login, register, sessionUser, destroySession, requireAuth, rateLimit, ensureDemoUser } from "./auth.js";
-import { providerStatus, resolveProvider, getProviders } from "./ai/index.js";
+import { providerStatus, getProviders, type ProviderId } from "./ai/index.js";
 import { toolCatalog, getTool } from "./tools/index.js";
 import { runAgent, logActivity } from "./agent/index.js";
 import { broadcast, subscribe, clientCount } from "./events.js";
@@ -299,10 +299,11 @@ function analyzeText(text: string) {
 router.get("/files", (_req, res) => res.json({ files: db.all("files").sort((a, b) => (b.createdAt as number) - (a.createdAt as number)) }));
 
 router.post("/files", (req, res) => {
-  const { name, type, size, data } = req.body ?? {};
-  if (typeof data !== "string" || typeof name !== "string") return res.status(400).json({ error: "Invalid upload" });
-  if (size > 12 * 1024 * 1024) return res.status(413).json({ error: "File too large (max 12 MB)" });
+  const { name, type, data } = req.body ?? {};
+  if (typeof data !== "string" || typeof name !== "string" || typeof type !== "string") return res.status(400).json({ error: "Invalid upload" });
   const buf = Buffer.from(data, "base64");
+  if (buf.length > 12 * 1024 * 1024) return res.status(413).json({ error: "File too large (max 12 MB)" });
+  const size = buf.length;
   const id = uid("file");
   fs.writeFileSync(path.join(FILES_DIR, id), buf);
 
@@ -394,15 +395,20 @@ router.get("/providers", (_req, res) => res.json(providerStatus()));
 router.post("/providers/select", (req, res) => {
   const id = String(req.body?.id ?? "");
   if (!["demo", "openai", "anthropic", "gemini", "local"].includes(id)) return res.status(400).json({ error: "Unknown provider" });
-  const existing = db.query("settings", (s) => s.id === "global")[0];
+
+  const provider = getProviders()[id as ProviderId];
+  if (!provider.configured) {
+    return res.status(409).json({
+      error: `Provider "${id}" is not configured. Set its API key server-side via environment variables.`,
+      status: providerStatus(),
+    });
+  }
+
+  const existing = db.find("settings", "global");
   const merged = { ...((existing?.data as object) ?? {}), provider: id };
   if (existing) db.update("settings", "global", { data: merged });
   else db.insert("settings", { id: "global", data: merged });
-  const status = providerStatus();
-  if (id !== "demo" && !getProviders()[id as keyof ReturnType<typeof getProviders>].configured) {
-    return res.status(409).json({ error: `Provider "${id}" is not configured. Set its API key server-side via environment variables.`, status });
-  }
-  res.json({ ok: true, status });
+  res.json({ ok: true, status: providerStatus() });
 });
 
 // ── Demo simulation endpoints (clearly labeled) ───────────────────────────────

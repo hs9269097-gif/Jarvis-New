@@ -156,9 +156,9 @@ add your secrets — these stay on the server and are **never** sent to the
 browser:
 
 ```
-AI_PROVIDER=openai        # openai | anthropic | gemini | local | demo
-AI_API_KEY=sk-...
-AI_MODEL=gpt-4o-mini
+AI_PROVIDER=anthropic     # openai | anthropic | gemini | local | demo
+AI_MODEL=claude-opus-5
+ANTHROPIC_API_KEY=sk-ant-...
 SEARCH_PROVIDER=brave     # optional — brave | tavily | serpapi
 SEARCH_API_KEY=...
 AUTH_REQUIRED=false       # set "true" to require login
@@ -191,16 +191,18 @@ Create `server/.env` (or repo-root `.env`) — this file is git-ignored:
 PORT=8787
 SESSION_SECRET=change-me-to-a-long-random-string
 
-# AI (pick one)
-AI_PROVIDER=openai            # openai | anthropic | gemini | local | demo
-AI_API_KEY=sk-...
-AI_BASE_URL=                  # optional, e.g. https://api.openai.com/v1
-AI_MODEL=gpt-4o-mini
-
-# Anthropic
+# AI (Anthropic Claude Opus 5)
+AI_PROVIDER=anthropic         # openai | anthropic | gemini | local | demo
+AI_MODEL=claude-opus-5
 ANTHROPIC_API_KEY=sk-ant-...
-# Gemini
-GEMINI_API_KEY=AIza...
+
+# Optional OpenAI-compatible provider
+AI_API_KEY=
+AI_BASE_URL=https://api.openai.com/v1
+
+# Optional Gemini provider
+GEMINI_API_KEY=
+
 # Local (Ollama etc.)
 LOCAL_AI_BASE_URL=http://localhost:11434/v1
 LOCAL_AI_MODEL=llama3

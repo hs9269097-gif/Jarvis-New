@@ -9,14 +9,16 @@ function env(key: string, fallback = ""): string {
   return v ? v : fallback;
 }
 
-// Load .env from repo root (works for both tsx dev and compiled dist)
-// src/config.ts → ../../ = repo root ; dist/config.js → ../../ = repo root
+// Load local server configuration without adding a runtime dependency.
+// Real process environment variables always win over values in either file.
+// src/config.ts → ../../ = project root ; dist/config.js → ../../ = project root
 const root = path.resolve(__dirname, "../..");
-const envFile = path.join(root, ".env");
-if (fs.existsSync(envFile)) {
+const envFiles = [path.join(root, ".env"), path.join(root, "server", ".env")];
+for (const envFile of envFiles) {
+  if (!fs.existsSync(envFile)) continue;
   const lines = fs.readFileSync(envFile, "utf8").split(/\r?\n/);
   for (const line of lines) {
-    const m = line.match(/^\s*([A-Z0-9_]+)\s*=\s*(.*)\s*$/);
+    const m = line.match(/^\s*(?:export\s+)?([A-Z0-9_]+)\s*=\s*(.*)\s*$/);
     if (m && !(m[1] in process.env)) process.env[m[1]] = m[2].replace(/^["']|["']$/g, "");
   }
 }
@@ -30,7 +32,8 @@ export const config = {
   dataDir: env("DATA_DIR", path.join(root, "server", "data")),
 
   ai: {
-    provider: env("AI_PROVIDER", "demo"),
+    // Empty means auto-detect the first configured real provider.
+    provider: env("AI_PROVIDER", ""),
     apiKey: env("AI_API_KEY", ""),
     baseUrl: env("AI_BASE_URL", ""),
     model: env("AI_MODEL", ""),

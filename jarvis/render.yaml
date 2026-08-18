@@ -34,13 +34,14 @@ services:
       # Secrets stay on the server; they are NEVER bundled into the client.
       # Demo Mode works with none of these set.
       - key: AI_PROVIDER
-        value: demo          # demo | openai | anthropic | gemini | local
+        value: anthropic     # demo | openai | anthropic | gemini | local
         sync: false
       - key: AI_API_KEY
         sync: false
       - key: AI_BASE_URL
         sync: false
       - key: AI_MODEL
+        value: claude-opus-5
         sync: false
       - key: ANTHROPIC_API_KEY
         sync: false

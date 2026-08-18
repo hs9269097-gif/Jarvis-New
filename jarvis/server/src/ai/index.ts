@@ -136,17 +136,21 @@ export class OpenAICompatProvider implements AIProvider {
 // ── Anthropic provider ────────────────────────────────────────────────────────
 export class AnthropicProvider implements AIProvider {
   id = "anthropic" as const;
-  label = "Anthropic Claude";
   constructor(
     private apiKey: string,
-    private model = "claude-3-5-sonnet-latest",
+    private model = "claude-opus-5",
   ) {}
+  get label() {
+    return `Anthropic Claude · ${this.model}`;
+  }
   get configured() {
     return Boolean(this.apiKey);
   }
   async *chat(messages: ChatMessage[], opts: ProviderOptions): AsyncGenerator<string> {
     const system = messages.filter((m) => m.role === "system").map((m) => m.content).join("\n");
     const rest = messages.filter((m) => m.role !== "system");
+    // Claude Opus 5 uses adaptive thinking by default and rejects non-default
+    // sampling parameters, so temperature is intentionally omitted.
     const res = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
@@ -157,8 +161,7 @@ export class AnthropicProvider implements AIProvider {
       body: JSON.stringify({
         model: this.model,
         system,
-        max_tokens: opts.maxTokens ?? 1024,
-        temperature: opts.temperature ?? DEFAULT_TEMPERATURE,
+        max_tokens: opts.maxTokens ?? 4096,
         stream: true,
         messages: rest.map((m) => ({ role: m.role === "assistant" ? "assistant" : "user", content: m.content })),
       }),
@@ -261,22 +264,32 @@ export function getProviders(): Record<ProviderId, AIProvider> {
   };
 }
 
-function userOverride(): Partial<ProviderId> | null {
-  const row = db.query("settings", (s) => s.id === "global")[0];
-  if (!row || !(row.provider as string)) return null;
-  return row.provider as ProviderId;
+function userOverride(): ProviderId | null {
+  const row = db.find("settings", "global");
+  const data = row?.data as { provider?: unknown } | undefined;
+  const provider = data?.provider;
+  if (typeof provider !== "string" || !["demo", "openai", "anthropic", "gemini", "local"].includes(provider)) return null;
+  return provider as ProviderId;
 }
 
 export function resolveProvider(): AIProvider {
   const providers = getProviders();
+
+  // 1. Explicit user override from Settings → Providers.
   const override = userOverride();
-  if (override && providers[override]?.configured) return providers[override];
+  if (override && providers[override].configured) return providers[override];
+
+  // 2. Explicit environment selection. An empty value enables auto-detection;
+  //    an explicit "demo" value intentionally forces Demo Mode.
   const envChoice = config.ai.provider as ProviderId;
-  if (providers[envChoice]?.configured) return providers[envChoice];
-  // Fall back to first configured real provider, else demo
+  if (envChoice && providers[envChoice]?.configured) return providers[envChoice];
+
+  // 3. Auto-detect the first configured real provider.
   for (const id of ["openai", "anthropic", "gemini", "local"] as const) {
     if (providers[id].configured) return providers[id];
   }
+
+  // 4. Keyless fallback.
   return providers.demo;
 }
 
