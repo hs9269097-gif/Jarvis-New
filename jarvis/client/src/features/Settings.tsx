@@ -169,7 +169,7 @@ export function Settings() {
                 ))}
               </div>
               <div className="mt-4 rounded-md border border-cyan-400/15 bg-cyan-400/5 p-3 font-mono text-[10px] leading-5 text-cyan-100/70">
-                # server/.env<br />AI_PROVIDER=openai<br />AI_API_KEY=sk-...<br />AI_MODEL=gpt-4o-mini
+                # server/.env<br />AI_PROVIDER=anthropic<br />AI_MODEL=claude-opus-5<br />ANTHROPIC_API_KEY=sk-ant-...
               </div>
             </div>
           )}
