@@ -2,8 +2,8 @@
 // AI PROVIDER ABSTRACTION LAYER
 // JARVIS never hardcodes a model vendor. Every provider implements `AIProvider`.
 // Providers are selected from environment variables, and can be overridden
-// per-user through Settings (stored server-side in the `providers` table).
-// All secret keys stay server-side.
+// per-user through Settings (stored server-side).
+// All secret keys stay server-side and are never sent to the browser.
 // ─────────────────────────────────────────────────────────────────────────────
 import { config } from "../config.js";
 import { db } from "../db/index.js";
@@ -29,6 +29,95 @@ export interface ProviderOptions {
 export type ProviderId = "demo" | "openai" | "anthropic" | "gemini" | "local";
 
 const DEFAULT_TEMPERATURE = 0.7;
+/** Upstream requests are abandoned after this long without completing. */
+const REQUEST_TIMEOUT_MS = 120_000;
+
+/**
+ * Combine the caller's AbortSignal with a timeout so a hung provider can never
+ * wedge a chat stream open forever. Returns the signal plus a cleanup fn.
+ */
+function withTimeout(signal?: AbortSignal): { signal: AbortSignal; done: () => void } {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(new Error("Provider request timed out")), REQUEST_TIMEOUT_MS);
+  const onAbort = () => ctrl.abort(signal?.reason);
+  if (signal) {
+    if (signal.aborted) ctrl.abort(signal.reason);
+    else signal.addEventListener("abort", onAbort, { once: true });
+  }
+  return {
+    signal: ctrl.signal,
+    done: () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+    },
+  };
+}
+
+/** Turn an upstream error body into a short, safe, human-readable message. */
+async function describeHttpError(res: Response, vendor: string): Promise<string> {
+  let detail = "";
+  try {
+    const text = (await res.text()).slice(0, 800);
+    try {
+      const j = JSON.parse(text) as { error?: { message?: string; type?: string } | string; message?: string };
+      const e = j.error;
+      detail = (typeof e === "string" ? e : e?.message) || j.message || text;
+    } catch {
+      detail = text;
+    }
+  } catch {
+    /* body already consumed or unreadable */
+  }
+  // Never echo a key back, even if the vendor included it in the error.
+  detail = detail.replace(/sk-[A-Za-z0-9_\-]{8,}/g, "sk-***");
+
+  const hint =
+    res.status === 401 || res.status === 403
+      ? " — check that your API key is valid and has credit."
+      : res.status === 404
+        ? " — the requested model name may not exist for this account."
+        : res.status === 429
+          ? " — rate limit or quota exceeded; wait a moment and retry."
+          : res.status >= 500
+            ? " — the provider is having trouble; retry shortly."
+            : "";
+  return `${vendor} error ${res.status}${detail ? `: ${detail}` : ""}${hint}`;
+}
+
+/**
+ * Read an SSE byte stream and yield each `data:` payload as a string.
+ * Handles chunk boundaries splitting mid-line and both \n and \r\n endings.
+ */
+async function* sseLines(res: Response, signal?: AbortSignal): AsyncGenerator<string> {
+  const reader = res.body!.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const lines = buf.split("\n");
+      buf = lines.pop() ?? "";
+      for (const line of lines) {
+        const s = line.trim();
+        if (!s || s.startsWith(":")) continue; // comment / keep-alive ping
+        if (!s.startsWith("data:")) continue;
+        yield s.slice(5).trim();
+      }
+      if (signal?.aborted) break;
+    }
+    // Flush any final line left in the buffer without a trailing newline.
+    const tail = buf.trim();
+    if (tail.startsWith("data:")) yield tail.slice(5).trim();
+  } finally {
+    try {
+      await reader.cancel();
+    } catch {
+      /* already closed */
+    }
+  }
+}
 
 function streamText(text: string, opts: ProviderOptions): AsyncGenerator<string> {
   // Token-ish chunks for a believable streaming effect
@@ -83,109 +172,148 @@ export function demoReply(input: string): string {
 
 // ── OpenAI-compatible provider (OpenAI, Azure, Groq, OpenRouter, Ollama…) ─────
 export class OpenAICompatProvider implements AIProvider {
-  id = "openai" as const;
-  label = "OpenAI-compatible";
+  readonly id: string;
+  readonly label: string;
   constructor(
     private baseUrl: string,
     private apiKey: string,
     private model: string,
-  ) {}
+    id = "openai",
+    label = "OpenAI-compatible",
+  ) {
+    this.id = id;
+    this.label = label;
+  }
   get configured() {
     return Boolean(this.apiKey);
   }
   async *chat(messages: ChatMessage[], opts: ProviderOptions): AsyncGenerator<string> {
-    const res = await fetch(`${this.baseUrl.replace(/\/$/, "")}/chat/completions`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${this.apiKey}` },
-      body: JSON.stringify({
-        model: this.model,
-        messages,
-        temperature: opts.temperature ?? DEFAULT_TEMPERATURE,
-        max_tokens: opts.maxTokens ?? 1024,
-        stream: true,
-      }),
-      signal: opts.signal,
-    });
-    if (!res.ok || !res.body) throw new Error(`Provider error ${res.status}: ${await res.text()}`);
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-    let buf = "";
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buf += decoder.decode(value, { stream: true });
-      const lines = buf.split("\n");
-      buf = lines.pop() ?? "";
-      for (const line of lines) {
-        const s = line.trim();
-        if (!s.startsWith("data:")) continue;
-        const payload = s.slice(5).trim();
+    const { signal, done } = withTimeout(opts.signal);
+    try {
+      const res = await fetch(`${this.baseUrl.replace(/\/+$/, "")}/chat/completions`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${this.apiKey}` },
+        body: JSON.stringify({
+          model: this.model,
+          messages,
+          temperature: opts.temperature ?? DEFAULT_TEMPERATURE,
+          max_tokens: opts.maxTokens ?? config.ai.maxTokens,
+          stream: true,
+        }),
+        signal,
+      });
+      if (!res.ok || !res.body) throw new Error(await describeHttpError(res, this.label));
+
+      for await (const payload of sseLines(res, signal)) {
         if (payload === "[DONE]") return;
         try {
-          const json = JSON.parse(payload);
+          const json = JSON.parse(payload) as {
+            choices?: { delta?: { content?: string } }[];
+            error?: { message?: string };
+          };
+          if (json.error?.message) throw new Error(`${this.label}: ${json.error.message}`);
           const delta = json.choices?.[0]?.delta?.content;
           if (delta) yield delta;
-        } catch {
-          /* ignore partial json */
+        } catch (e) {
+          // Re-throw real provider errors; ignore partial/unparsable JSON frames.
+          if (e instanceof Error && e.message.startsWith(this.label)) throw e;
         }
       }
+    } finally {
+      done();
     }
   }
 }
 
 // ── Anthropic provider ────────────────────────────────────────────────────────
+
+/**
+ * The Anthropic Messages API is strict: the `messages` array may not be empty,
+ * must start with a `user` turn, and may not contain two consecutive turns with
+ * the same role. Conversation history replayed from the database can violate
+ * all three, which returns a 400. Normalise it here.
+ */
+function normalizeAnthropicMessages(messages: ChatMessage[]): { role: "user" | "assistant"; content: string }[] {
+  const cleaned = messages
+    .filter((m) => m.role !== "system")
+    .map((m) => ({ role: m.role === "assistant" ? ("assistant" as const) : ("user" as const), content: m.content.trim() }))
+    .filter((m) => m.content.length > 0);
+
+  // Drop leading assistant turns — the conversation must open with the user.
+  while (cleaned.length && cleaned[0]!.role === "assistant") cleaned.shift();
+
+  // Merge consecutive same-role turns into one.
+  const merged: { role: "user" | "assistant"; content: string }[] = [];
+  for (const m of cleaned) {
+    const last = merged[merged.length - 1];
+    if (last && last.role === m.role) last.content += `\n\n${m.content}`;
+    else merged.push({ ...m });
+  }
+
+  // Never send an empty array.
+  if (!merged.length) merged.push({ role: "user", content: "Hello" });
+  return merged;
+}
+
 export class AnthropicProvider implements AIProvider {
   id = "anthropic" as const;
   label = "Anthropic Claude";
   constructor(
     private apiKey: string,
-    private model = "claude-3-5-sonnet-latest",
+    private model = "claude-sonnet-4-5",
   ) {}
   get configured() {
     return Boolean(this.apiKey);
   }
   async *chat(messages: ChatMessage[], opts: ProviderOptions): AsyncGenerator<string> {
-    const system = messages.filter((m) => m.role === "system").map((m) => m.content).join("\n");
-    const rest = messages.filter((m) => m.role !== "system");
-    const res = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": this.apiKey,
-        "anthropic-version": "2023-06-01",
-      },
-      body: JSON.stringify({
-        model: this.model,
-        system,
-        max_tokens: opts.maxTokens ?? 1024,
-        temperature: opts.temperature ?? DEFAULT_TEMPERATURE,
-        stream: true,
-        messages: rest.map((m) => ({ role: m.role === "assistant" ? "assistant" : "user", content: m.content })),
-      }),
-      signal: opts.signal,
-    });
-    if (!res.ok || !res.body) throw new Error(`Provider error ${res.status}: ${await res.text()}`);
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-    let buf = "";
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buf += decoder.decode(value, { stream: true });
-      const lines = buf.split("\n");
-      buf = lines.pop() ?? "";
-      for (const line of lines) {
-        const s = line.trim();
-        if (!s.startsWith("data:")) continue;
-        const payload = s.slice(5).trim();
+    const system = messages
+      .filter((m) => m.role === "system")
+      .map((m) => m.content)
+      .join("\n\n")
+      .trim();
+    const rest = normalizeAnthropicMessages(messages);
+
+    const { signal, done } = withTimeout(opts.signal);
+    try {
+      const res = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": this.apiKey,
+          "anthropic-version": "2023-06-01",
+        },
+        body: JSON.stringify({
+          model: this.model,
+          // Omit `system` entirely when empty — the API rejects an empty string.
+          ...(system ? { system } : {}),
+          max_tokens: opts.maxTokens ?? config.ai.maxTokens,
+          temperature: Math.min(1, Math.max(0, opts.temperature ?? DEFAULT_TEMPERATURE)),
+          stream: true,
+          messages: rest,
+        }),
+        signal,
+      });
+      if (!res.ok || !res.body) throw new Error(await describeHttpError(res, this.label));
+
+      for await (const payload of sseLines(res, signal)) {
         if (!payload) continue;
+        let json: {
+          type?: string;
+          delta?: { text?: string };
+          error?: { message?: string };
+        };
         try {
-          const json = JSON.parse(payload);
-          if (json.type === "content_block_delta" && json.delta?.text) yield json.delta.text;
+          json = JSON.parse(payload);
         } catch {
-          /* ignore */
+          continue; // partial frame
         }
+        // Anthropic reports mid-stream failures as an `error` event.
+        if (json.type === "error") throw new Error(`${this.label}: ${json.error?.message ?? "stream error"}`);
+        if (json.type === "content_block_delta" && json.delta?.text) yield json.delta.text;
+        if (json.type === "message_stop") return;
       }
+    } finally {
+      done();
     }
   }
 }
@@ -202,47 +330,67 @@ export class GeminiProvider implements AIProvider {
     return Boolean(this.apiKey);
   }
   async *chat(messages: ChatMessage[], opts: ProviderOptions): AsyncGenerator<string> {
-    const system = messages.filter((m) => m.role === "system").map((m) => m.content).join("\n");
-    const rest = messages.filter((m) => m.role !== "system");
-    const res = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${this.model}:streamGenerateContent?alt=sse&key=${this.apiKey}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          systemInstruction: { parts: [{ text: system }] },
-          contents: rest.map((m) => ({ role: m.role === "assistant" ? "model" : "user", parts: [{ text: m.content }] })),
-          generationConfig: { temperature: opts.temperature ?? DEFAULT_TEMPERATURE },
-        }),
-        signal: opts.signal,
-      },
-    );
-    if (!res.ok || !res.body) throw new Error(`Provider error ${res.status}: ${await res.text()}`);
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-    let buf = "";
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buf += decoder.decode(value, { stream: true });
-      const lines = buf.split("\n");
-      buf = lines.pop() ?? "";
-      for (const line of lines) {
-        const s = line.trim();
-        if (!s.startsWith("data:")) continue;
+    const system = messages
+      .filter((m) => m.role === "system")
+      .map((m) => m.content)
+      .join("\n\n")
+      .trim();
+    const rest = messages
+      .filter((m) => m.role !== "system" && m.content.trim())
+      .map((m) => ({ role: m.role === "assistant" ? "model" : "user", parts: [{ text: m.content }] }));
+    if (!rest.length) rest.push({ role: "user", parts: [{ text: "Hello" }] });
+
+    const { signal, done } = withTimeout(opts.signal);
+    try {
+      const res = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${this.model}:streamGenerateContent?alt=sse`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            // Header auth keeps the key out of URLs (and therefore out of logs).
+            "x-goog-api-key": this.apiKey,
+          },
+          body: JSON.stringify({
+            ...(system ? { systemInstruction: { parts: [{ text: system }] } } : {}),
+            contents: rest,
+            generationConfig: {
+              temperature: opts.temperature ?? DEFAULT_TEMPERATURE,
+              maxOutputTokens: opts.maxTokens ?? config.ai.maxTokens,
+            },
+          }),
+          signal,
+        },
+      );
+      if (!res.ok || !res.body) throw new Error(await describeHttpError(res, this.label));
+
+      for await (const payload of sseLines(res, signal)) {
+        if (!payload) continue;
         try {
-          const json = JSON.parse(s.slice(5).trim());
-          const text = json.candidates?.[0]?.content?.parts?.map((p: { text?: string }) => p.text ?? "").join("");
+          const json = JSON.parse(payload) as {
+            candidates?: { content?: { parts?: { text?: string }[] } }[];
+            error?: { message?: string };
+          };
+          if (json.error?.message) throw new Error(`${this.label}: ${json.error.message}`);
+          const text = json.candidates?.[0]?.content?.parts?.map((p) => p.text ?? "").join("");
           if (text) yield text;
-        } catch {
-          /* ignore */
+        } catch (e) {
+          if (e instanceof Error && e.message.startsWith(this.label)) throw e;
         }
       }
+    } finally {
+      done();
     }
   }
 }
 
 // ── Provider factory ──────────────────────────────────────────────────────────
+export const PROVIDER_IDS: ProviderId[] = ["demo", "openai", "anthropic", "gemini", "local"];
+
+export function isProviderId(v: unknown): v is ProviderId {
+  return typeof v === "string" && (PROVIDER_IDS as string[]).includes(v);
+}
+
 export function getProviders(): Record<ProviderId, AIProvider> {
   return {
     demo: new DemoProvider(),
@@ -250,33 +398,76 @@ export function getProviders(): Record<ProviderId, AIProvider> {
       config.ai.baseUrl || "https://api.openai.com/v1",
       config.ai.apiKey,
       config.ai.model || "gpt-4o-mini",
+      "openai",
+      "OpenAI-compatible",
     ),
-    anthropic: new AnthropicProvider(config.ai.anthropicKey, config.ai.model || undefined),
-    gemini: new GeminiProvider(config.ai.geminiKey, config.ai.model || undefined),
+    // Each vendor reads its OWN model env var. AI_MODEL is OpenAI-specific and
+    // must never leak into Anthropic/Gemini — sending "gpt-4o-mini" to
+    // Anthropic returns a 404 "model not found".
+    anthropic: new AnthropicProvider(config.ai.anthropicKey, config.ai.anthropicModel),
+    gemini: new GeminiProvider(config.ai.geminiKey, config.ai.geminiModel),
     local: new OpenAICompatProvider(
       config.ai.localBaseUrl || "http://localhost:11434/v1",
-      config.ai.localBaseUrl ? "ollama" : "", // Ollama needs no key; "configured" = base URL present
+      // Ollama / LM Studio need no real key; "configured" = base URL present.
+      config.ai.localBaseUrl ? "local-no-key-required" : "",
       config.ai.localModel || "llama3",
+      "local",
+      "Local model",
     ),
   };
 }
 
-function userOverride(): Partial<ProviderId> | null {
+/**
+ * The user's provider choice from Settings → Providers.
+ * Settings rows are stored as { id: "global", data: { provider: "anthropic" } },
+ * so the value lives under `data` — reading `row.provider` always returned
+ * undefined, which silently ignored every manual provider selection.
+ */
+function userOverride(): ProviderId | null {
   const row = db.query("settings", (s) => s.id === "global")[0];
-  if (!row || !(row.provider as string)) return null;
-  return row.provider as ProviderId;
+  if (!row) return null;
+  const data = (row.data ?? {}) as Record<string, unknown>;
+  const choice = data.provider ?? (row as Record<string, unknown>).provider;
+  return isProviderId(choice) ? choice : null;
+}
+
+/** True when at least one real (non-demo) provider has credentials. */
+export function hasRealProvider(providers = getProviders()): boolean {
+  return (["anthropic", "openai", "gemini", "local"] as const).some((id) => providers[id].configured);
 }
 
 export function resolveProvider(): AIProvider {
   const providers = getProviders();
+  const realAvailable = hasRealProvider(providers);
+  // Demo is only reachable when no real key exists, or it is explicitly
+  // permitted via AI_ALLOW_DEMO=true. With a key configured, JARVIS must not
+  // answer with simulated text.
+  const demoAllowed = !realAvailable || config.ai.allowDemo;
+
+  // 1. Explicit user override from Settings → Providers.
   const override = userOverride();
-  if (override && providers[override]?.configured) return providers[override];
-  const envChoice = config.ai.provider as ProviderId;
-  if (providers[envChoice]?.configured) return providers[envChoice];
-  // Fall back to first configured real provider, else demo
-  for (const id of ["openai", "anthropic", "gemini", "local"] as const) {
+  if (override) {
+    if (override === "demo") {
+      if (demoAllowed) return providers.demo;
+      // Ignore a stale "demo" selection rather than downgrading a real setup.
+    } else if (providers[override].configured) {
+      return providers[override];
+    }
+  }
+
+  // 2. Explicit AI_PROVIDER env var.
+  const envChoice = config.ai.provider;
+  if (isProviderId(envChoice) && envChoice !== "demo" && providers[envChoice].configured) {
+    return providers[envChoice];
+  }
+  if (envChoice === "demo" && demoAllowed && !override) return providers.demo;
+
+  // 3. Auto-detect: first real provider with credentials configured.
+  for (const id of ["anthropic", "openai", "gemini", "local"] as const) {
     if (providers[id].configured) return providers[id];
   }
+
+  // 4. No real provider is configured — demo is the only thing left.
   return providers.demo;
 }
 
@@ -287,7 +478,7 @@ export function providerStatus() {
     active: active.id,
     activeLabel: active.label,
     demo: active.id === "demo",
-    providers: Object.entries(providers).map(([id, p]) => ({ id, label: p.label, configured: p.configured })),
-    envConfigured: Object.values(providers).some((p) => p.id !== "demo" && p.configured),
+    providers: PROVIDER_IDS.map((id) => ({ id, label: providers[id].label, configured: providers[id].configured })),
+    envConfigured: PROVIDER_IDS.some((id) => id !== "demo" && providers[id].configured),
   };
 }

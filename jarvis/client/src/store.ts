@@ -106,7 +106,11 @@ export const useChat = create<ChatStore>((set, get) => ({
     useCore.getState().setState("THINKING");
     if (useCore.getState().sound) sfx.send();
 
-    const handle = streamChat(message, get().conversationId, 0.7, {
+    // Use the temperature the user configured in Settings → AI instead of a
+    // hardcoded 0.7 that silently ignored the slider.
+    const temperature = useSettings.getState().settings.ai.temperature ?? 0.7;
+
+    const handle = streamChat(message, get().conversationId, temperature, {
       onEvent: (e) => {
         const s = get();
         switch (e.type) {
@@ -147,26 +151,34 @@ export const useChat = create<ChatStore>((set, get) => ({
               doneTick: st.doneTick + 1,
               streaming: false,
             }));
+            window.clearTimeout(safetyTimer);
             break;
           case "error":
-            set((st) => ({ messages: st.messages.map((m) => (m.id === assistantMsg.id ? { ...m, streaming: false, error: true } : m)) }));
+            set((st) => ({
+              // Stop the spinner on error too — previously `streaming` stayed
+              // true, which locked the composer until the 90s timeout.
+              streaming: false,
+              messages: st.messages.map((m) => (m.id === assistantMsg.id ? { ...m, streaming: false, error: true } : m)),
+            }));
             useCore.getState().flash("ERROR", 2200);
             pushToast("error", e.message || "JARVIS could not complete this operation.");
             if (useCore.getState().sound) sfx.error();
+            window.clearTimeout(safetyTimer);
             break;
         }
       },
     });
     set({ cancel: handle.cancel });
 
-    // Finalize when stream ends (handled via done/error; also safety timeout)
-    window.setTimeout(() => {
-      const st = get();
-      if (st.streaming) {
-        set((x) => ({ streaming: false, messages: x.messages.map((m) => (m.id === assistantMsg.id ? { ...m, streaming: false } : m)) }));
-        useCore.getState().setState("IDLE");
-      }
-    }, 90000);
+    // Safety net: if the stream dies without a done/error event, release the UI.
+    // Cleared on completion so a later reply is never cut off mid-stream.
+    const safetyTimer = window.setTimeout(() => {
+      if (!get().streaming) return;
+      handle.cancel();
+      set((x) => ({ streaming: false, messages: x.messages.map((m) => (m.id === assistantMsg.id ? { ...m, streaming: false } : m)) }));
+      useCore.getState().setState("IDLE");
+      pushToast("warning", "REQUEST TIMED OUT", "JARVIS did not respond in time. Please retry.");
+    }, 180000);
   },
   stop: () => {
     get().cancel?.();

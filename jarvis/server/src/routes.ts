@@ -9,8 +9,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { config } from "./config.js";
 import { db, now, uid } from "./db/index.js";
-import { hashPassword, login, register, sessionUser, destroySession, requireAuth, rateLimit, ensureDemoUser } from "./auth.js";
-import { providerStatus, resolveProvider, getProviders } from "./ai/index.js";
+import { login, register, sessionUser, destroySession, requireAuth, rateLimit, ensureDemoUser } from "./auth.js";
+import { providerStatus, getProviders, isProviderId, hasRealProvider } from "./ai/index.js";
 import { toolCatalog, getTool } from "./tools/index.js";
 import { runAgent, logActivity } from "./agent/index.js";
 import { broadcast, subscribe, clientCount } from "./events.js";
@@ -23,21 +23,46 @@ function currentUser(req: Request): string {
   return sessionUser(req)?.id ?? DEMO_USER;
 }
 
+const SESSION_MAX_AGE = 60 * 60 * 24 * 30; // 30 days
+
+/** Session cookie. `Secure` is added in production so it never travels in clear. */
+function sessionCookie(token: string): string {
+  const parts = [
+    `jarvis_session=${token}`,
+    "HttpOnly",
+    "Path=/",
+    "SameSite=Lax",
+    `Max-Age=${SESSION_MAX_AGE}`,
+  ];
+  if (config.isProduction) parts.push("Secure");
+  return parts.join("; ");
+}
+
 function sse(res: Response, gen: () => AsyncGenerator<unknown>) {
   res.writeHead(200, {
     "Content-Type": "text/event-stream",
-    "Cache-Control": "no-cache",
+    "Cache-Control": "no-cache, no-transform",
     Connection: "keep-alive",
     "X-Accel-Buffering": "no",
   });
+  // Flush headers immediately so the browser starts reading the stream even if
+  // the first event takes a while to produce.
+  res.flushHeaders?.();
+
   (async () => {
     try {
       for await (const event of gen()) {
-        if (res.destroyed || res.writableEnded) return;
+        // `break` (not `return`) so the generator's finally block still runs
+        // and the assistant's partial reply gets persisted.
+        if (res.destroyed || res.writableEnded) break;
         res.write(`data: ${JSON.stringify(event)}\n\n`);
       }
     } catch (e) {
-      if (!res.destroyed) res.write(`data: ${JSON.stringify({ type: "error", message: (e as Error).message, retryable: true })}\n\n`);
+      const err = e as Error;
+      // A client disconnect is normal, not an error worth reporting.
+      if (err.name !== "AbortError" && !res.destroyed && !res.writableEnded) {
+        res.write(`data: ${JSON.stringify({ type: "error", message: err.message, retryable: true })}\n\n`);
+      }
     } finally {
       if (!res.destroyed && !res.writableEnded) res.end();
     }
@@ -47,13 +72,16 @@ function sse(res: Response, gen: () => AsyncGenerator<unknown>) {
 // ── Health / bootstrap ────────────────────────────────────────────────────────
 router.get("/health", (_req, res) => res.json({ ok: true, name: "JARVIS", time: now() }));
 
-router.get("/bootstrap", (_req, res) => {
+router.get("/bootstrap", (req, res) => {
+  // Compute the provider status once — it instantiates every provider.
+  const provider = providerStatus();
   res.json({
     name: "JARVIS",
     version: "1.0.0",
-    demoMode: providerStatus().demo,
-    provider: providerStatus(),
-    auth: { required: config.authRequired, user: null },
+    demoMode: provider.demo,
+    provider,
+    // Report the real signed-in user instead of a hardcoded null.
+    auth: { required: config.authRequired, user: sessionUser(req) },
     time: now(),
   });
 });
@@ -64,8 +92,10 @@ router.post("/auth/login", rateLimit(10, 60000), (req, res) => {
   if (typeof username !== "string" || typeof password !== "string") return res.status(400).json({ error: "Missing credentials" });
   const result = login(username, password);
   if (!result.ok) return res.status(401).json({ error: "Invalid credentials" });
-  res.setHeader("Set-Cookie", `jarvis_session=${result.token}; HttpOnly; Path=/; SameSite=Lax; Max-Age=${60 * 60 * 24 * 30}`);
-  logActivity(DEMO_USER, "auth", `User "${username}" signed in`);
+  res.setHeader("Set-Cookie", sessionCookie(result.token!));
+  // Attribute the login to the account that actually signed in, not the
+  // hardcoded demo user.
+  logActivity((result.user as { id?: string })?.id ?? DEMO_USER, "auth", `User "${username}" signed in`);
   res.json({ ok: true, user: result.user });
 });
 
@@ -75,14 +105,15 @@ router.post("/auth/register", rateLimit(10, 60000), (req, res) => {
     return res.status(400).json({ error: "Username ≥3 chars, password ≥6 chars" });
   const result = register(username, password);
   if (!result.ok) return res.status(409).json({ error: result.error });
-  res.setHeader("Set-Cookie", `jarvis_session=${result.token}; HttpOnly; Path=/; SameSite=Lax; Max-Age=${60 * 60 * 24 * 30}`);
+  res.setHeader("Set-Cookie", sessionCookie(result.token!));
   res.json({ ok: true });
 });
 
 router.post("/auth/logout", (req, res) => {
   const cookie = (req.headers.cookie ?? "").split(";").map((c) => c.trim()).find((c) => c.startsWith("jarvis_session="));
   if (cookie) destroySession(cookie.slice("jarvis_session=".length));
-  res.setHeader("Set-Cookie", "jarvis_session=; HttpOnly; Path=/; Max-Age=0");
+  // Attributes must match the cookie that was set, or browsers won't clear it.
+  res.setHeader("Set-Cookie", `jarvis_session=; HttpOnly; Path=/; SameSite=Lax; Max-Age=0${config.isProduction ? "; Secure" : ""}`);
   res.json({ ok: true });
 });
 
@@ -97,30 +128,57 @@ router.use(requireAuth);
 // ── Chat (SSE streaming) ──────────────────────────────────────────────────────
 router.post("/chat", rateLimit(30, 60000), (req, res) => {
   const body = req.body ?? {};
-  const message = String(body.message ?? "").slice(0, 8000);
+  const message = String(body.message ?? "").trim().slice(0, 8000);
   if (!message) return res.status(400).json({ error: "Empty message" });
-  const conversationId = typeof body.conversationId === "string" ? body.conversationId : uid("conv");
+  const conversationId = typeof body.conversationId === "string" && body.conversationId ? body.conversationId : uid("conv");
   const userId = currentUser(req);
 
-  db.insert("messages", { id: uid("msg"), conversationId, role: "user", content: message, createdAt: now() });
-  const history = db.query("messages", (m) => m.conversationId === conversationId).slice(-20)
+  // Build history from what existed BEFORE this turn, sorted oldest→newest.
+  // The store is a hash map with no ordering guarantee, so slicing the raw
+  // query could feed the model a scrambled conversation.
+  const history = db
+    .query("messages", (m) => m.conversationId === conversationId)
+    .sort((a, b) => (a.createdAt as number) - (b.createdAt as number))
+    .slice(-20)
     .map((m) => ({ role: m.role as "user" | "assistant", content: m.content as string }));
+
+  db.insert("messages", { id: uid("msg"), conversationId, role: "user", content: message, createdAt: now() });
+
+  // Abort the model call if the client hangs up, so we stop paying for tokens
+  // nobody will ever see.
+  const abort = new AbortController();
+  res.on("close", () => abort.abort());
+
+  // Honour the temperature saved in Settings when the client doesn't send one.
+  const saved = (db.query("settings", (s) => s.id === "global")[0]?.data ?? {}) as { ai?: { temperature?: number } };
+  const rawTemp = body.temperature ?? saved.ai?.temperature ?? 0.7;
+  const temperature = Math.min(2, Math.max(0, Number.isFinite(Number(rawTemp)) ? Number(rawTemp) : 0.7));
 
   const fullAnswer: string[] = [];
   sse(res, async function* () {
     yield { type: "conversation", id: conversationId };
-    const generator = runAgent(message, history, { temperature: Number(body.temperature ?? 0.7) });
-    for await (const event of generator) {
-      if (event.type === "delta") fullAnswer.push(event.text);
-      if (event.type === "tool") broadcast("tool", event);
-      if (event.type === "state") broadcast("agent_state", { state: event.state });
-      yield event;
+    try {
+      for await (const event of runAgent(message, history, { temperature, signal: abort.signal })) {
+        if (event.type === "delta") fullAnswer.push(event.text);
+        if (event.type === "tool") broadcast("tool", event);
+        if (event.type === "state") broadcast("agent_state", { state: event.state });
+        yield event;
+      }
+    } finally {
+      // Persist whatever was generated even if the client disconnected early,
+      // so a cancelled reply is not lost from the conversation history.
+      const answer = fullAnswer.join("");
+      if (answer) {
+        db.insert("messages", { id: uid("msg"), conversationId, role: "assistant", content: answer, createdAt: now() });
+      }
+      const preview = answer.slice(0, 90);
+      if (db.find("conversations", conversationId)) {
+        db.update("conversations", conversationId, { lastMessageAt: now(), preview });
+      } else {
+        db.insert("conversations", { id: conversationId, title: message.slice(0, 60), preview, createdAt: now(), lastMessageAt: now() });
+      }
+      logActivity(userId, "chat", message.slice(0, 120));
     }
-    db.insert("messages", { id: uid("msg"), conversationId, role: "assistant", content: fullAnswer.join(""), createdAt: now() });
-    const conv = db.find("conversations", conversationId);
-    if (conv) db.update("conversations", conversationId, { lastMessageAt: now(), preview: fullAnswer.join("").slice(0, 90) });
-    else db.insert("conversations", { id: conversationId, title: message.slice(0, 60), preview: fullAnswer.join("").slice(0, 90), createdAt: now(), lastMessageAt: now() });
-    logActivity(userId, "chat", message.slice(0, 120));
   });
 });
 
@@ -299,11 +357,22 @@ function analyzeText(text: string) {
 router.get("/files", (_req, res) => res.json({ files: db.all("files").sort((a, b) => (b.createdAt as number) - (a.createdAt as number)) }));
 
 router.post("/files", (req, res) => {
-  const { name, type, size, data } = req.body ?? {};
-  if (typeof data !== "string" || typeof name !== "string") return res.status(400).json({ error: "Invalid upload" });
-  if (size > 12 * 1024 * 1024) return res.status(413).json({ error: "File too large (max 12 MB)" });
+  const { name, data } = req.body ?? {};
+  if (typeof data !== "string" || typeof name !== "string" || !name.trim()) {
+    return res.status(400).json({ error: "Invalid upload" });
+  }
+  // `type` is attacker-controlled and was assumed to be a string — a non-string
+  // (or missing) MIME type crashed the route on `type.includes(...)`.
+  const type = typeof req.body?.type === "string" ? req.body.type.toLowerCase() : "application/octet-stream";
+
   const buf = Buffer.from(data, "base64");
+  // Trust the decoded byte length, not the client-reported size.
+  const size = buf.byteLength;
+  if (size > 12 * 1024 * 1024) return res.status(413).json({ error: "File too large (max 12 MB)" });
+  if (size === 0) return res.status(400).json({ error: "Empty file" });
+
   const id = uid("file");
+  // `id` is server-generated, so it cannot traverse outside FILES_DIR.
   fs.writeFileSync(path.join(FILES_DIR, id), buf);
 
   let text = "";
@@ -393,16 +462,32 @@ router.put("/settings", (req, res) => {
 router.get("/providers", (_req, res) => res.json(providerStatus()));
 router.post("/providers/select", (req, res) => {
   const id = String(req.body?.id ?? "");
-  if (!["demo", "openai", "anthropic", "gemini", "local"].includes(id)) return res.status(400).json({ error: "Unknown provider" });
+  if (!isProviderId(id)) return res.status(400).json({ error: "Unknown provider" });
+
+  // Validate BEFORE persisting. Previously the unusable choice was written to
+  // the database first, so a rejected selection still corrupted the setting.
+  if (id !== "demo" && !getProviders()[id].configured) {
+    return res.status(409).json({
+      error: `Provider "${id}" is not configured. Set its API key server-side in jarvis/.env, then restart the server.`,
+      status: providerStatus(),
+    });
+  }
+
+  // Refuse to downgrade a working setup to simulated replies.
+  if (id === "demo" && hasRealProvider() && !config.ai.allowDemo) {
+    return res.status(409).json({
+      error: "A real AI provider is configured, so Demo Mode is disabled. Set AI_ALLOW_DEMO=true in jarvis/.env if you deliberately want simulated replies.",
+      status: providerStatus(),
+    });
+  }
+
   const existing = db.query("settings", (s) => s.id === "global")[0];
   const merged = { ...((existing?.data as object) ?? {}), provider: id };
   if (existing) db.update("settings", "global", { data: merged });
   else db.insert("settings", { id: "global", data: merged });
-  const status = providerStatus();
-  if (id !== "demo" && !getProviders()[id as keyof ReturnType<typeof getProviders>].configured) {
-    return res.status(409).json({ error: `Provider "${id}" is not configured. Set its API key server-side via environment variables.`, status });
-  }
-  res.json({ ok: true, status });
+
+  logActivity(currentUser(req), "provider", `AI provider switched to "${id}"`);
+  res.json({ ok: true, status: providerStatus() });
 });
 
 // ── Demo simulation endpoints (clearly labeled) ───────────────────────────────
@@ -415,7 +500,8 @@ router.post("/demo/task", (req, res) => {
   const iv = setInterval(() => {
     p += Math.round(8 + Math.random() * 14);
     const t = db.find("tasks", task.id as string);
-    if (!t) return clearInterval(iv);
+    // Task deleted mid-simulation → stop the timer instead of leaking it.
+    if (!t) { clearInterval(iv); return; }
     if (p >= 100) {
       db.update("tasks", task.id as string, { state: "COMPLETED", progress: 100, logs: [...((t.logs as string[]) ?? []), "Completed (DEMO)"] });
       broadcast("task", { type: "updated", task: db.find("tasks", task.id as string) });
@@ -429,8 +515,10 @@ router.post("/demo/task", (req, res) => {
 
 export function initServer() {
   ensureDemoUser();
-  // Periodic simulated telemetry events
-  setInterval(() => {
+  // Periodic telemetry broadcast. Skip the work entirely when nobody is
+  // listening, and don't hold the event loop open during shutdown.
+  const timer = setInterval(() => {
+    if (clientCount() === 0) return;
     broadcast("metrics", collectMetrics());
     if (Math.random() < 0.12) {
       broadcast("security_event", {
@@ -441,4 +529,5 @@ export function initServer() {
       });
     }
   }, 3000);
+  timer.unref();
 }

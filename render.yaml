@@ -1,7 +1,10 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # RENDER BLUEPRINT — JARVIS Command Center
-# Push this repo to GitHub, then in Render: New → Blueprint → pick this repo.
-# Render will create the web service below automatically.
+#
+# This file must live at the REPOSITORY ROOT for Render to auto-detect it
+# (New → Blueprint). The application itself lives in the `jarvis/` subfolder,
+# which is why `rootDir` is set below — without it Render runs npm at the repo
+# root, where there is no package.json.
 #
 # It runs:  npm install && npm run build  →  npm start
 # The Express server binds to Render's $PORT and serves the built client
@@ -13,6 +16,8 @@ services:
     name: jarvis
     runtime: node
     plan: free
+    # The npm workspace root — all commands below run inside this folder.
+    rootDir: jarvis
     buildCommand: npm install && npm run build
     startCommand: npm start
     healthCheckPath: /api/health
@@ -20,6 +25,9 @@ services:
     envVars:
       - key: NODE_VERSION
         value: 20
+
+      - key: NODE_ENV
+        value: production
 
       # Secret used to sign session cookies — Render generates a random value.
       - key: SESSION_SECRET
@@ -30,21 +38,28 @@ services:
         value: "false"
         sync: false
 
-      # ── AI providers — fill these in Render dashboard (Environment tab). ──
-      # Secrets stay on the server; they are NEVER bundled into the client.
-      # Demo Mode works with none of these set.
+      # ── AI provider ───────────────────────────────────────────────────────
+      # Set the API key in the Render dashboard (Environment tab). Secrets stay
+      # on the server and are NEVER bundled into the client.
       - key: AI_PROVIDER
-        value: demo          # demo | openai | anthropic | gemini | local
+        value: anthropic     # anthropic | openai | gemini | local | demo
         sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: ANTHROPIC_MODEL
+        value: claude-sonnet-4-5
+        sync: false
+
+      # Other providers (optional)
       - key: AI_API_KEY
         sync: false
       - key: AI_BASE_URL
         sync: false
       - key: AI_MODEL
         sync: false
-      - key: ANTHROPIC_API_KEY
-        sync: false
       - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
         sync: false
       - key: LOCAL_AI_BASE_URL
         sync: false

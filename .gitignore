@@ -1,0 +1,37 @@
+# ── Secrets ──────────────────────────────────────────────────────────────────
+# NEVER commit real API keys. Only .env.example is tracked.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# ── Dependencies ─────────────────────────────────────────────────────────────
+node_modules/
+.npm/
+.pnpm-store/
+
+# ── Build output ─────────────────────────────────────────────────────────────
+dist/
+build/
+out/
+*.tsbuildinfo
+.vite/
+
+# ── Runtime data (embedded JSON store + uploaded files) ──────────────────────
+jarvis/server/data/
+data/
+*.db.json
+
+# ── Logs ─────────────────────────────────────────────────────────────────────
+logs/
+*.log
+npm-debug.log*
+yarn-error.log*
+
+# ── Editor / OS ──────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp

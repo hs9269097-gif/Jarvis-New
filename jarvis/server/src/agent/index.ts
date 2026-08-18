@@ -219,8 +219,25 @@ export async function* runAgent(
       }
     }
   } catch (e) {
-    yield { type: "error", message: `AI provider failure: ${(e as Error).message}`, retryable: true };
-    answer = "I could not reach the AI provider. The request has been logged — you can retry, or switch providers in Settings.";
+    const err = e as Error;
+    // A cancelled request is not a failure — the client simply hung up.
+    if (err.name === "AbortError" || opts.signal?.aborted) return;
+
+    // `fetch failed` is Node's opaque network error. Translate it into
+    // something the user can actually act on.
+    const isNetwork = /fetch failed|ENOTFOUND|ECONNREFUSED|EAI_AGAIN|ETIMEDOUT|network/i.test(err.message);
+    const detail = isNetwork
+      ? `Could not reach ${provider.label}. Check the server's internet connection, and that outbound HTTPS to the provider's API host is not blocked by a firewall or proxy.`
+      : err.message;
+
+    yield { type: "error", message: `${provider.label} failed: ${detail}`, retryable: true };
+
+    // NEVER substitute a simulated demo answer for a real provider failure.
+    // A fake reply that looks genuine is worse than an honest error, so we
+    // report the fault and let the user retry.
+    answer =
+      `⚠️ **${provider.label} request failed.**\n\n${detail}\n\n` +
+      `Your API key is configured, so this is a connection or provider-side issue — not a missing key. Please retry.`;
     yield { type: "delta", text: answer };
   }
 
