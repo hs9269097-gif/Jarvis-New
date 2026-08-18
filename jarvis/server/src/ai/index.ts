@@ -431,15 +431,28 @@ function userOverride(): ProviderId | null {
   return isProviderId(choice) ? choice : null;
 }
 
+/** True when at least one real (non-demo) provider has credentials. */
+export function hasRealProvider(providers = getProviders()): boolean {
+  return (["anthropic", "openai", "gemini", "local"] as const).some((id) => providers[id].configured);
+}
+
 export function resolveProvider(): AIProvider {
   const providers = getProviders();
+  const realAvailable = hasRealProvider(providers);
+  // Demo is only reachable when no real key exists, or it is explicitly
+  // permitted via AI_ALLOW_DEMO=true. With a key configured, JARVIS must not
+  // answer with simulated text.
+  const demoAllowed = !realAvailable || config.ai.allowDemo;
 
   // 1. Explicit user override from Settings → Providers.
   const override = userOverride();
   if (override) {
-    // "demo" is a deliberate choice, not a fallback — honour it immediately.
-    if (override === "demo") return providers.demo;
-    if (providers[override].configured) return providers[override];
+    if (override === "demo") {
+      if (demoAllowed) return providers.demo;
+      // Ignore a stale "demo" selection rather than downgrading a real setup.
+    } else if (providers[override].configured) {
+      return providers[override];
+    }
   }
 
   // 2. Explicit AI_PROVIDER env var.
@@ -447,15 +460,14 @@ export function resolveProvider(): AIProvider {
   if (isProviderId(envChoice) && envChoice !== "demo" && providers[envChoice].configured) {
     return providers[envChoice];
   }
-  // AI_PROVIDER=demo with no user override → demo, as requested.
-  if (envChoice === "demo" && !override) return providers.demo;
+  if (envChoice === "demo" && demoAllowed && !override) return providers.demo;
 
   // 3. Auto-detect: first real provider with credentials configured.
   for (const id of ["anthropic", "openai", "gemini", "local"] as const) {
     if (providers[id].configured) return providers[id];
   }
 
-  // 4. Demo fallback — always available, never fails.
+  // 4. No real provider is configured — demo is the only thing left.
   return providers.demo;
 }
 

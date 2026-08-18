@@ -141,6 +141,9 @@ const server = app.listen(config.port, config.host, () => {
     console.log("");
     console.log("  ⚠  No AI provider key detected — running the demo engine.");
     console.log("     Add ANTHROPIC_API_KEY (or another provider key) to jarvis/.env");
+    console.log("     Looked for env files in: jarvis/.env, jarvis/server/.env, <repo>/.env");
+  } else {
+    console.log("  Demo mode  disabled — real provider in use, no simulated replies");
   }
   console.log("");
 });

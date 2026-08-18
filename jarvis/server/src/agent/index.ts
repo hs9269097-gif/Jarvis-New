@@ -227,17 +227,17 @@ export async function* runAgent(
     // something the user can actually act on.
     const isNetwork = /fetch failed|ENOTFOUND|ECONNREFUSED|EAI_AGAIN|ETIMEDOUT|network/i.test(err.message);
     const detail = isNetwork
-      ? `Could not reach ${provider.label}. Check the server's internet connection, any firewall or proxy, and that the API host is reachable.`
+      ? `Could not reach ${provider.label}. Check the server's internet connection, and that outbound HTTPS to the provider's API host is not blocked by a firewall or proxy.`
       : err.message;
 
-    yield { type: "error", message: `AI provider failure: ${detail}`, retryable: true };
+    yield { type: "error", message: `${provider.label} failed: ${detail}`, retryable: true };
 
-    // Still give the user a usable reply instead of an empty bubble: fall back
-    // to the offline demo engine rather than failing the whole turn.
-    const fallback = composeDemoAnswer(userMessage, intents, plan.toolCalls) || demoReply(userMessage);
+    // NEVER substitute a simulated demo answer for a real provider failure.
+    // A fake reply that looks genuine is worse than an honest error, so we
+    // report the fault and let the user retry.
     answer =
-      `⚠️ **${provider.label} is unreachable.** ${detail}\n\n` +
-      `_Falling back to the offline demo engine for this reply:_\n\n${fallback}`;
+      `⚠️ **${provider.label} request failed.**\n\n${detail}\n\n` +
+      `Your API key is configured, so this is a connection or provider-side issue — not a missing key. Please retry.`;
     yield { type: "delta", text: answer };
   }
 

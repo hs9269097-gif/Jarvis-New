@@ -10,7 +10,7 @@ import path from "node:path";
 import { config } from "./config.js";
 import { db, now, uid } from "./db/index.js";
 import { login, register, sessionUser, destroySession, requireAuth, rateLimit, ensureDemoUser } from "./auth.js";
-import { providerStatus, getProviders, isProviderId } from "./ai/index.js";
+import { providerStatus, getProviders, isProviderId, hasRealProvider } from "./ai/index.js";
 import { toolCatalog, getTool } from "./tools/index.js";
 import { runAgent, logActivity } from "./agent/index.js";
 import { broadcast, subscribe, clientCount } from "./events.js";
@@ -469,6 +469,14 @@ router.post("/providers/select", (req, res) => {
   if (id !== "demo" && !getProviders()[id].configured) {
     return res.status(409).json({
       error: `Provider "${id}" is not configured. Set its API key server-side in jarvis/.env, then restart the server.`,
+      status: providerStatus(),
+    });
+  }
+
+  // Refuse to downgrade a working setup to simulated replies.
+  if (id === "demo" && hasRealProvider() && !config.ai.allowDemo) {
+    return res.status(409).json({
+      error: "A real AI provider is configured, so Demo Mode is disabled. Set AI_ALLOW_DEMO=true in jarvis/.env if you deliberately want simulated replies.",
       status: providerStatus(),
     });
   }

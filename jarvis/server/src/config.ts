@@ -116,6 +116,11 @@ export const config = {
     localModel: env("LOCAL_AI_MODEL", "llama3"),
     maxTokens: envNum("AI_MAX_TOKENS", 2048),
     temperature: envNum("AI_TEMPERATURE", 0.7),
+    // When a real provider key is configured, JARVIS must never quietly answer
+    // with the simulated demo engine — a fake reply that looks real is worse
+    // than a clear error. Set AI_ALLOW_DEMO=true only if you actually want the
+    // keyless simulator.
+    allowDemo: envBool("AI_ALLOW_DEMO", false),
   },
 
   search: {
