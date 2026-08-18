@@ -219,8 +219,25 @@ export async function* runAgent(
       }
     }
   } catch (e) {
-    yield { type: "error", message: `AI provider failure: ${(e as Error).message}`, retryable: true };
-    answer = "I could not reach the AI provider. The request has been logged — you can retry, or switch providers in Settings.";
+    const err = e as Error;
+    // A cancelled request is not a failure — the client simply hung up.
+    if (err.name === "AbortError" || opts.signal?.aborted) return;
+
+    // `fetch failed` is Node's opaque network error. Translate it into
+    // something the user can actually act on.
+    const isNetwork = /fetch failed|ENOTFOUND|ECONNREFUSED|EAI_AGAIN|ETIMEDOUT|network/i.test(err.message);
+    const detail = isNetwork
+      ? `Could not reach ${provider.label}. Check the server's internet connection, any firewall or proxy, and that the API host is reachable.`
+      : err.message;
+
+    yield { type: "error", message: `AI provider failure: ${detail}`, retryable: true };
+
+    // Still give the user a usable reply instead of an empty bubble: fall back
+    // to the offline demo engine rather than failing the whole turn.
+    const fallback = composeDemoAnswer(userMessage, intents, plan.toolCalls) || demoReply(userMessage);
+    answer =
+      `⚠️ **${provider.label} is unreachable.** ${detail}\n\n` +
+      `_Falling back to the offline demo engine for this reply:_\n\n${fallback}`;
     yield { type: "delta", text: answer };
   }
 

@@ -33,17 +33,41 @@ agent system, tool registry, memory, tasks, automation, auth, live telemetry)
 ## Quick start
 
 ```bash
+cd jarvis
 npm install          # installs both workspaces
-cp .env.example .env # optional — configure providers (see below)
-npm run build        # type-check + build server & client
+cp .env.example .env # configure providers (see below) — .env is git-ignored
+npm run build        # type-check + build client & server
 npm start            # serves the full app on http://localhost:8787
 ```
 
 For development with hot reload:
 
 ```bash
-npm run dev          # Vite (5173) + API server (8787)
+npm run dev          # Vite (5173) + API server (8787), /api is proxied
 ```
+
+### Connecting Claude (Anthropic)
+
+Put your key in `jarvis/.env` — never in client code, and never committed:
+
+```env
+AI_PROVIDER=anthropic
+ANTHROPIC_API_KEY=sk-ant-api03-...
+ANTHROPIC_MODEL=claude-sonnet-4-5
+```
+
+Restart the server. On boot it prints which provider is active:
+
+```
+AI provider Anthropic Claude (anthropic)
+```
+
+If it says `DEMO MODE`, the key was not found — check that `jarvis/.env` exists
+and that the variable name is spelled exactly `ANTHROPIC_API_KEY`.
+
+`.env` is searched in `jarvis/.env`, then `jarvis/server/.env`, then the repo
+root. Real environment variables always win over file values, so hosting
+platforms (Render, Docker, systemd) work without any file at all.
 
 ---
 
